@@ -1,0 +1,419 @@
+// ========= Libraries =========
+#include <Wire.h>               //I2C communication
+#include "MAX30105.h"           //Pulse oximeter
+#include "heartRate.h"          //Heart rate calculations
+#include <DallasTemperature.h>  //Temperature sensor
+#include <OneWire.h>            //I2C communication
+#include <Adafruit_GFX.h>       //OLED graphics
+#include <Adafruit_SSD1306.h>   //OLED
+#include <NimBLEDevice.h>       //BLE communication
+
+// ========= Configuration Values =========
+
+//If debugging for serial monitor communciation
+#define DEBUG true
+
+//Pulse Oximeter Configuration
+const byte ledBrightness = 50;
+const byte sampleAverage = 1;
+const byte ledMode = 2;
+const byte sampleRate = 100;
+const int pulseWidth = 69;
+const int adcRange = 4096;
+
+//OLED configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+//Temp configuration
+#define ONE_WIRE_BUS 4
+
+//GSR configuration 
+#define GSR_PIN 34 //Pin connected to GSR
+int sampleIndexGSR = 0; 
+
+//Sample sizes
+#define MAX_SAMPLES 20
+#define MAX_HRV_SAMPLES 30
+
+
+// ========= Objects =========
+MAX30105 particleSensor;                                                   //Pulse oximeter
+OneWire oneWire(ONE_WIRE_BUS);                                             //Digital communication
+DallasTemperature sensors(&oneWire);                                       //Temperature
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);  //OLED
+
+
+// =========BLE Characteristics =========
+NimBLECharacteristic* hrChar;
+NimBLECharacteristic* hrvChar;
+NimBLECharacteristic* tChar;
+NimBLECharacteristic* gsrChar; 
+NimBLEServer* pServer;
+
+
+// ========= Buffers =========
+float tempBuffer[MAX_SAMPLES];  //Buffer arrays with size of samples declared
+float heartRateBuffer[MAX_SAMPLES];
+float gsrBuffer[MAX_SAMPLES];
+float hrvBuffer[MAX_HRV_SAMPLES];
+
+// ========= Values =========
+//Indexes for tracking buffer filling
+int sampleIndexT = 0;
+int sampleIndexHR = 0;
+int sampleIndexHRV = 0;
+
+//Global variables for calculations
+float currentBPM = 0;
+float rrInterval = 0;
+float rmssd = 0;
+float sumSqDiffs = 0;
+
+// ========= Flags =========
+bool tempBufferSent = false;  //Tracks code progress for stability and to avoid unnecessary repetitions
+bool hrBufferSent = false;
+bool hrvCalculatedSent = false;
+bool systemInitialized = false;
+bool dataSentToApp = false;
+bool deviceConnected = false;
+bool gsrBufferSent = false; 
+
+
+// ========= Timing =========
+unsigned long lastSampleTime = 0;
+unsigned long lastBeatTime = 0;
+unsigned long lastHRSampleTime = 0;
+unsigned long lastGsrSampleTime = 0; 
+unsigned long lastOLEDUpdate = 0;
+const unsigned long sampleInterval = 1000;  //1 second
+const unsigned long oledInterval = 1000;    //1 second
+
+
+// ========= BLE Callback =========
+class MyServerCallbacks : public NimBLEServerCallbacks  //Class that defines behavior on device connection inherited from Nimble library
+{
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo)
+    override {
+    deviceConnected = true;
+    Serial.println("Client Connected.");
+  }
+
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason)  //Connection details and why client disconnected
+    override {
+    deviceConnected = false;
+    Serial.println("Client Disconnected.");
+    NimBLEDevice::startAdvertising();  //When disconnected, ESP32 begins to advertise values to reconnect with devices
+  }
+};
+
+
+
+void setup() {
+  // ========= Initialize Serial Monitor =========
+  Serial.begin(115200);                                //Initialize serial monitor and baud rate
+  if (DEBUG) Serial.println("Serial Monitor Ready.");  //Debug set to true means serial monitor will print values to ensure logic is working properly. This will be uniform throughout the rest of the script.
+
+
+  // ========= I2C Initialization =========
+  Wire.begin(21, 22);  //Pins 21 and 22 on ESP32
+
+  // ========= OLED Initialization =========
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    if (DEBUG) Serial.println(F("OLED not found. Please check wiring/connections"));
+    while (1)
+      ;  //Code won't continue until problem is resoved.
+  }
+
+  //OLED Updates
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+
+  // ========= Temp Sensor Initialization =========
+  sensors.begin();
+
+
+  // ========= Pulse Oximeter =========
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    if (DEBUG) Serial.println(F("MAX30102 not found. Please check wiring/connections."));
+    while (1)
+      ;  //Code won't continue until problem is resolved.
+  }
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+
+
+  // =========BLE Initialization =========
+  NimBLEDevice::init("StressMonitor");             //Naming device
+  pServer = NimBLEDevice::createServer();          //Creating server
+  pServer->setCallbacks(new MyServerCallbacks());  //Calling to connection function
+
+  // Naming service and custom UUID
+  NimBLEService* stressService = pServer->createService("12345678-1234-1234-1234-1234567890ab");
+
+  //Defining characteristics for the buffers
+  hrChar = stressService->createCharacteristic("2A37", NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
+  hrvChar = stressService->createCharacteristic("beb5483e-36e1-4688-b7f5-ea07361b26b9", NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
+  tChar = stressService->createCharacteristic("beb5483e-36e1-4688-b7f5-ea07361b26a8", NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
+  gsrChar = stressService->createCharacteristic("bada8f01-1111-2222-3333-abcdefabcdef", NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ); 
+
+  //Seting initial values before sensors read
+  hrChar->setValue("0.0");
+  hrvChar->setValue("0.0");
+  tChar->setValue("0.0");
+  gsrChar->setValue("0.0");
+
+  //Starting service
+  stressService->start();
+
+  //Starting advertising
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(stressService->getUUID());
+  pAdvertising->setName("StressMonitor");
+  pAdvertising->start();
+
+  if (DEBUG) Serial.println("BLE Advertising Started");
+
+  delay(2000);  //Delay for system stability
+  systemInitialized = true;
+}
+
+
+
+void loop() {
+  //========= Finger Placement =========
+  long testirValue = particleSensor.getIR();
+
+  //Skips data collection if no finger is detected
+  if (testirValue < 10000)  //Low IR value means finger is not on the sensor
+  {
+    //Serial print
+   // if (DEBUG) Serial.println("Waiting for finger...");
+
+    // OLED update
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Place finger");
+    display.display();
+
+    delay(500);  //Wait before checking again
+    return;
+  }
+
+  unsigned long now = millis();  //Time
+
+  // ========= Temperature Sampling =========
+  if (sampleIndexT < MAX_SAMPLES && now - lastSampleTime >= sampleInterval) {
+    lastSampleTime = now;                     //Update time
+    sensors.requestTemperatures();            //Get temp
+    float temp = sensors.getTempFByIndex(0);  //define temp in farenheit
+    temp +=10.0;
+    tempBuffer[sampleIndexT++] = temp;        //Add to buffer
+  }
+
+  // ========= GSR Sampling ========= It outputs V using voltage divider to convert it to µS
+  if (sampleIndexGSR < MAX_SAMPLES && now - lastGsrSampleTime >=sampleInterval)
+  {
+    lastGsrSampleTime = now; 
+    float Vout = analogRead(GSR_PIN) * (3.3/4095.0); //Converts to voltage 
+    float R_fixed = 10000.0; //10 kΩ R
+    float R_skin = ((3.3 * R_fixed) / Vout) - R_fixed; //Voltage divider formula
+    float conductance = 1e6/R_skin; //Conductance in µS
+    gsrBuffer[sampleIndexGSR++] = conductance; 
+  }
+
+  //========= Heartbeat and HRV Sampling ==========
+  long irValue = particleSensor.getIR();
+  if (checkForBeat(irValue)) 
+  {
+    unsigned long beatNow = millis();     //Time
+    rrInterval = beatNow - lastBeatTime;  //Get RR interval for HRV
+    lastBeatTime = beatNow;               //Update beat time
+
+
+    if (rrInterval > 400 && rrInterval < 1500)  //Filtering out bad signals
+    {
+      currentBPM = 60000.0 / rrInterval;
+
+      if (currentBPM >= 40 && currentBPM <= 200)  //Filtering out bad signals
+      {
+        if (sampleIndexHR < MAX_SAMPLES && (now - lastHRSampleTime) >= sampleInterval)  //If more samples are still needed
+        {
+          lastHRSampleTime = now;  //HR
+          heartRateBuffer[sampleIndexHR++] = currentBPM;
+        }
+        if (sampleIndexHRV < MAX_HRV_SAMPLES)  //HRV
+        {
+          if (sampleIndexHRV == 0 || abs(rrInterval - hrvBuffer[sampleIndexHRV -1])<400)
+          {
+          hrvBuffer[sampleIndexHRV++] = rrInterval;
+          }
+          else if (DEBUG)
+          {
+            Serial.print("Rejected RR Interval.");
+          }
+        }
+      }
+    }
+  }
+
+  // ========= HRV RMSSD Calculation =========
+  if (sampleIndexHRV == MAX_HRV_SAMPLES && !hrvCalculatedSent) //If buffer is filled and HRV has not yet been calculated
+  {
+    sumSqDiffs = 0;
+    for (int i = 1; i < MAX_HRV_SAMPLES; i++) 
+    {
+      float diff = hrvBuffer[i] - hrvBuffer[i - 1];
+      sumSqDiffs += diff * diff;
+    }
+    rmssd = sqrt(sumSqDiffs / (MAX_HRV_SAMPLES - 1));
+    if (DEBUG) 
+    {
+      Serial.print("HRV RMSSD: ");
+      Serial.print(rmssd);
+      Serial.println(" ms");
+    }
+    hrvCalculatedSent = true;
+  }
+
+
+  // ========= OLED Display =========
+  if (now - lastOLEDUpdate > oledInterval)  //OLED update loop time 
+  {
+    lastOLEDUpdate = now;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+
+    if (!systemInitialized) 
+    {
+      display.println("Initializing...");
+    } 
+    else 
+    {
+      display.println("Status:"); //Updates status every 1 second 
+      display.print("T: ");
+      display.println(tempBufferSent ? "Done" : "...");
+      display.print("H: ");
+      display.println(hrBufferSent ? "Done" : "...");
+      display.print("HRV: ");
+      display.println(hrvCalculatedSent ? "Done" : "...");
+      display.print("GSR: "); 
+      display.println(gsrBufferSent ? "Done" : "..."); 
+    }
+
+    display.display();
+  }
+
+
+  // ======== Buffer Status ========
+ if (sampleIndexT == MAX_SAMPLES && !tempBufferSent)
+  {
+  if (DEBUG)
+   {
+    Serial.println("Temp buffer complete:");
+    for (int i = 0; i < MAX_SAMPLES; i++) 
+    {
+      Serial.print("T[");
+      Serial.print(i);
+      Serial.print("]: ");
+      Serial.print(tempBuffer[i]);
+      Serial.println(" F");
+    }
+  }
+  tempBufferSent = true;
+ }
+
+
+  if (sampleIndexHR == MAX_SAMPLES && !hrBufferSent) //Prints values to serial monitor from the buffer when complete 
+  {
+   if (DEBUG) 
+   {
+     Serial.println("HR buffer complete:");
+     for (int i = 0; i < MAX_SAMPLES; i++) 
+     {
+       Serial.print("HR[");
+       Serial.print(i);
+       Serial.print("]: ");
+       Serial.print(heartRateBuffer[i]);
+       Serial.println(" BPM");
+    }
+  }
+  hrBufferSent = true;
+ }
+
+ if (sampleIndexGSR == MAX_SAMPLES && !gsrBufferSent) 
+ {
+  if (DEBUG) 
+  {
+    Serial.println("GSR buffer complete:");
+    for (int i = 0; i < MAX_SAMPLES; i++)
+    {
+      Serial.print("GSR[");
+      Serial.print(i); 
+      Serial.print("]: ");
+      Serial.print(gsrBuffer[i]);
+      Serial.println("µS");
+    }
+  }
+  gsrBufferSent = true; 
+ }
+ 
+
+  // ========= BLE Notification =========
+  if (tempBufferSent && hrBufferSent && hrvCalculatedSent && gsrBufferSent)
+{
+  float avgHR = 0, avgTemp = 0, avgGSR = 0;
+  for (int i = 0; i < MAX_SAMPLES; i++) {
+    avgHR += heartRateBuffer[i];
+    avgTemp += tempBuffer[i];
+    avgGSR += gsrBuffer[i];
+  }
+  avgHR /= MAX_SAMPLES;
+  avgTemp /= MAX_SAMPLES;
+  avgGSR /= MAX_SAMPLES;
+
+  String hrData = String(avgHR, 1);
+  String hrvData = String(rmssd, 1);
+  String tempData = String(avgTemp, 1);
+  String gsrData = String(avgGSR, 2);
+
+  // ALWAYS keep setValue() updated with latest values
+  hrChar->setValue(hrData.c_str());
+  hrvChar->setValue(hrvData.c_str());
+  tChar->setValue(tempData.c_str());
+  gsrChar->setValue(gsrData.c_str());
+
+  // Send notify ONCE
+  if (!dataSentToApp) {
+    hrChar->notify();
+    hrvChar->notify();
+    tChar->notify();
+    gsrChar->notify();
+    dataSentToApp = true;
+    Serial.println("✅ Data sent via notify()");
+  }
+
+  // Confirm what’s being stored
+  Serial.print("Current HR BLE: "); Serial.println(hrData);
+  Serial.print("Current HRV BLE: "); Serial.println(hrvData);
+  Serial.print("Current Temp BLE: "); Serial.println(tempData);
+  Serial.print("Current GSR BLE: "); Serial.println(gsrData);
+}
+
+  static unsigned long lastSendTime = 0;
+if (millis() - lastSendTime > 10000 && deviceConnected) {
+  lastSendTime = millis();
+  dataSentToApp = false; // let it resend the data
+  tempBufferSent = hrBufferSent = hrvCalculatedSent = gsrBufferSent = true; // force send
+}
+
+}
